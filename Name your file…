@@ -1,0 +1,507 @@
+"use strict";
+
+var inputIterationName = document.getElementById('inputIterationName');
+var selectProjects = document.getElementById('selectProjects');
+var inputOutputFilePath = document.getElementById('inputOutputFilePath');
+var btnDoTheJob = document.getElementById('buttonDoTheJob');
+var btnShowInExplorer = document.getElementById('buttonShowInExplorer');
+
+var Q = require('../node_modules/rally/node_modules/q');
+var rallyModule = require('../common/rallyModule.js');
+var exportModule  = require('../common/exportModule.js');
+
+
+const CONSTANTS = {
+	CONSISTENT: 'Consistent',
+	INCONSISTENT: 'Inconsistent',
+	EMPTY_STRING: '',
+
+	// For Root Cause iteration validation
+	UNKNOWN_ROOT_CAUSE: 'Not a US or DE'
+};
+
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+var lastSuccessfulOutputFilePath;
+
+function InitOutputPath() {
+	var path = require('path');
+	// lastSuccessfulOutputFilePath = path.normalize(__dirname + '\\..') + '\\output\\IterationAnalysis.xml';
+	lastSuccessfulOutputFilePath = path.normalize(__dirname + '\\..\\..\\..') + '\\output\\IterationAnalysis.xml';
+	inputOutputFilePath.value = lastSuccessfulOutputFilePath;
+}
+
+function ShowInExplorer() {
+	var shell = require('shell');
+	// Must use b-slash for the file path
+	shell.showItemInFolder(lastSuccessfulOutputFilePath);
+}
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+var output_IndependentDEs;  // An array of IndepDEStructs
+var output_DEsUnderUSs;  // An array of DEwithUSStructs
+
+class IndependentDE {
+	//构造函数
+	constructor(formattedID, resolution, rootCauseVersion, rootCauseReference, rcIteration, iterationConsistency) {
+		this.FormattedID = formattedID;
+		this.Resolution = resolution;
+		this.RootCauseVersion = rootCauseVersion;
+		this.RootCauseReference = rootCauseReference;
+		this.RCIteration = rcIteration;
+		this.IterationConsistency = iterationConsistency;
+	}
+}
+
+class DEwithUS {
+	//构造函数
+	constructor(
+		formattedID, userStory, resolution, taOwners_US, taOwners_DE, taOwnerConsistency,
+		rootCauseVersion, rootCauseReference, rcIteration, iterationConsistency
+	) {
+		this.FormattedID = formattedID;
+		this.UserStory = userStory;
+		this.Resolution = resolution;
+		this.TAOwners_US = taOwners_US;
+		this.TAOwners_DE = taOwners_DE;
+		this.TAOwnerConsistency = taOwnerConsistency;
+		this.RootCauseVersion = rootCauseVersion;
+		this.RootCauseReference = rootCauseReference;
+		this.RCIteration = rcIteration;
+		this.IterationConsistency = iterationConsistency;
+	}
+}
+
+function DoTheJob() {
+	onJobStart();
+
+	console.log('Querying for independent DEs...');
+
+	// Mind-bending promise chain
+	rallyModule.queryIndependentDEs(
+		inputIterationName.value, selectProjects.value,
+		['FormattedID', 'Resolution', 'c_RootCauseReference', 'c_RootCauseVersion']
+	)
+	.then(function(result) {
+		console.log('Processing independent DEs...');
+
+		return processIndependentDEs(result.Results);
+	})
+	.then(function() {
+		console.log('Querying for DEs with USs...');
+
+		// Proceed to the next query
+		return rallyModule.queryUSs(
+			inputIterationName.value, selectProjects.value,
+			['FormattedID', 'Defects', 'Tasks', 'Iteration']
+		);
+	})
+	.then(function(result) {
+		console.log('Processing DEs with USs...');
+
+		return processUSs(result.Results);
+	})
+	.then(doExport)
+	.then(onJobFinish)
+	.fail(onError);	// This should catch any error in the promise chain
+}
+
+function processUSs(result_USs) {
+	var promises = [];
+
+	// For each US, get its direct TA children
+	// intimidating promise loops and chains
+	for (var i = 0; i < result_USs.length; ++i) {
+		promises.push(
+			processSingleUS(result_USs[i])
+		);
+	}
+
+	// "Wait" until all USs are handled
+	return Q.all(promises);
+
+	// TODO: Much slower version, but guarantees output order
+	// Handle USs in a synchronous way, thus much slower
+	// See http://stackoverflow.com/questions/20100245/how-can-i-execute-array-of-promises-in-sequential-order
+	// return result_USs.reduce(function(curr, next) {
+	// 	return curr.then(function() {
+	// 		return processSingleUS(next);
+	// 	});
+	// }, Q.resolve());
+}
+
+function processSingleUS(us) {
+	return rallyModule.queryTAs_fromCollection(
+		us.Tasks,
+		['FormattedID', 'Owner']
+	)
+	.then(function(result) {
+		// Save all "direct" child TA owners in a Set
+		var setTAOwners_US = new Set();
+
+		var TAResults = result.Results;
+		// For each TA under this US
+		for (var i = 0; i < TAResults.length; ++i) {
+			var Owner = TAResults[i].Owner;
+			// TODO: Some TAs have no owner
+			if (Owner != null) {
+				if(Owner._refObjectName == null)
+				{
+					Owner._refObjectName = "NULL";
+				}
+				setTAOwners_US.add(Owner._refObjectName);
+			}
+		}
+
+		return setTAOwners_US;
+	})
+	.then(function(setTAOwners_US) {
+		// Note that a US may not have child DEs,
+		// but we are doing the query anyway
+		// since it will just return an array of length 0
+		return rallyModule.queryDEs_fromCollection(
+			us.Defects,
+			['FormattedID', 'Resolution', 'Tasks', 'c_RootCauseReference', 'c_RootCauseVersion']
+		)
+		.then(function(result) {
+			var promises = [];
+
+			var DEResults = result.Results;
+			for (var i = 0; i < DEResults.length; ++i) {
+				promises.push(
+					processSingleDE(us.FormattedID, DEResults[i], setTAOwners_US)
+				);
+			}
+
+			// "Wait" until all DEs are handled
+			return Q.all(promises);
+		});
+	});
+}
+
+// For a DE under a US, query for all its child TAs' owners,
+// and check whether setTAOwners_US(direct child TA owners of the US)
+// contains all of them
+function processSingleDE(usID, de, setTAOwners_US) {
+	return rallyModule.queryTAs_fromCollection(
+		de.Tasks,
+		['FormattedID', 'Owner']
+	)
+	.then(function(result) {
+		var strTAOwners_US = '';
+		setTAOwners_US.forEach(function(value) {
+			strTAOwners_US += value + '&#10;';
+		});
+
+		var deClass = new DEwithUS(
+			de.FormattedID,
+			usID,
+			de.Resolution,
+			strTAOwners_US,
+			CONSTANTS.EMPTY_STRING,
+			CONSTANTS.EMPTY_STRING,
+			de.c_RootCauseVersion,  // This field can be null
+			de.c_RootCauseReference,  // This field can be null
+			CONSTANTS.EMPTY_STRING,
+			CONSTANTS.EMPTY_STRING
+		);
+		output_DEsUnderUSs.push(deClass);
+
+		validateTAOwnerConsistency(deClass, setTAOwners_US, result.Results);
+
+		return validateIterationConsistency(deClass);
+	});
+}
+
+function validateTAOwnerConsistency(deClass, setTAOwners_US, arrTAResults) {
+	var strTAOwners_DE = '';
+	var passValidation = true;
+
+	// For each TA under this DE
+	for (var i = 0; i < arrTAResults.length; ++i) {
+		var TAId = arrTAResults[i].FormattedID;
+
+		// Check if the TA has a owner
+		if (arrTAResults[i].Owner != null) {
+			var TAOwnerName = arrTAResults[i].Owner._refObjectName;
+
+			// Do the owner match
+			if (setTAOwners_US.has(TAOwnerName)) {
+				console.log('  ', TAId, TAOwnerName);
+				strTAOwners_DE += TAId + ' ' + TAOwnerName;
+			} else {
+				// console.log('  ', TAId, TAOwnerName, '!!!!!!');
+				strTAOwners_DE += '!!!!!! ' + TAId + ' ' + TAOwnerName + ' !!!!!!';
+				passValidation = false;
+			}
+
+		} else {
+			strTAOwners_DE += TAId + ' [NO OWNER]'
+		}
+
+		strTAOwners_DE += '&#10;';
+	}
+
+	deClass.TAOwners_DE = strTAOwners_DE;
+	deClass.TAOwnerConsistency = passValidation ? CONSTANTS.CONSISTENT : CONSTANTS.INCONSISTENT;
+}
+
+function processIndependentDEs(arrIndependentDEs) {
+	var promises = [];
+
+	for (var i = 0; i < arrIndependentDEs.length; ++i) {
+		var de = arrIndependentDEs[i];
+		var deClass = new IndependentDE(
+			de.FormattedID,
+			de.Resolution,
+			de.c_RootCauseVersion,  // This field can be null
+			de.c_RootCauseReference,  // This field can be null. Will handle that during export
+			CONSTANTS.EMPTY_STRING,
+			CONSTANTS.EMPTY_STRING
+		);
+		output_IndependentDEs.push(deClass);
+
+		promises.push(validateIterationConsistency(deClass));
+	}
+
+	return Q.all(promises);
+}
+
+// Keep a global reference for these regexes to avoid re-compilation,
+// thus improving performance
+var deRegex = /^DE\d+\b/;
+var usRegex = /^US\d+\b/;
+function validateIterationConsistency(deClass) {
+	if (deClass.RootCauseReference == null) {
+		return;
+	}
+
+	// Do a regex match on the Root Cause Reference string
+	// See if it is referencing a DE or US
+	var matchResults = deRegex.exec(deClass.RootCauseReference);
+	if (matchResults != null) {
+		// The root cause is a DE
+		return rallyModule.queryDEByID(matchResults[0], ['Iteration'])
+		.then(function(result) {
+			var de = result.Results[0];
+			deClass.RCIteration = de.Iteration._refObjectName;
+			deClass.IterationConsistency =
+				(deClass.RCIteration === inputIterationName.value) ? CONSTANTS.CONSISTENT : CONSTANTS.INCONSISTENT;
+		});
+	} else {
+		matchResults = usRegex.exec(deClass.RootCauseReference);
+		if (matchResults != null) {
+			// The root cause is a US
+			return rallyModule.queryUSByID(matchResults[0], ['Iteration'])
+			.then(function(result) {
+				var us = result.Results[0];
+				deClass.RCIteration = us.Iteration._refObjectName;
+				deClass.IterationConsistency =
+					(deClass.RCIteration === inputIterationName.value) ? CONSTANTS.CONSISTENT : CONSTANTS.INCONSISTENT;
+			});
+		} else {
+			deClass.RCIteration = CONSTANTS.UNKNOWN_ROOT_CAUSE;
+			return;
+		}
+	}
+}
+
+function doExport() {
+	console.log('Exporting...');
+
+	var arrNotADefect = [];
+
+	exportModule.init();
+
+	// Export independent DEs
+	exportModule.appendNewSheet('Independent DEs');
+	exportModule.setCurrentSheet(0);
+	exportModule.setColumnWidth(1, 75);
+	exportModule.setColumnWidth(2, 150);
+	exportModule.setColumnWidth(3, 150);
+	exportModule.setColumnWidth(4, 150);
+	exportModule.setColumnWidth(5, 150);
+	exportModule.setColumnWidth(6, 75);
+	exportModule.addHeaderRow([
+		'ID', 'Resolution',
+		'Root Cause Version', 'Root Cause Reference', 'Root Cause Iteration&#10;[' + inputIterationName.value + ']', 'Iteration Consistency'
+	]);
+	for (var i = 0; i < output_IndependentDEs.length; ++i) {
+		var deClass = output_IndependentDEs[i];
+
+		// Will export these later
+		if (deClass.Resolution == 'Not a Defect') {
+			arrNotADefect.push(deClass);
+			continue;
+		}
+
+		exportModule.appendNewRow([
+			deClass.FormattedID,
+			deClass.Resolution,
+			(deClass.RootCauseVersion == null) ? '' : deClass.RootCauseVersion,
+			(deClass.RootCauseReference == null) ? '' : deClass.RootCauseReference,
+			deClass.RCIteration,
+			deClass.IterationConsistency
+		]);
+	}
+	// Export 'Not a Defect's to bottom of table
+	for (var i = 0; i < arrNotADefect.length; ++i) {
+		var deClass = arrNotADefect[i];
+		exportModule.appendNewRow([
+			deClass.FormattedID,
+			deClass.Resolution,
+			(deClass.RootCauseVersion == null) ? '' : deClass.RootCauseVersion,
+			(deClass.RootCauseReference == null)? '' : deClass.RootCauseReference,
+			deClass.RCIteration,
+			deClass.IterationConsistency
+		]);
+	}
+	exportModule.improveReadability();
+
+	// Clear the array
+	arrNotADefect = [];
+
+	// Export DEs associated to USs
+	exportModule.appendNewSheet('DEs with USs');
+	exportModule.setCurrentSheet(1);
+	exportModule.setColumnWidth(1, 75);
+	exportModule.setColumnWidth(2, 75);
+	exportModule.setColumnWidth(3, 150);
+	exportModule.setColumnWidth(4, 180);
+	exportModule.setColumnWidth(5, 225);
+	exportModule.setColumnWidth(6, 75);
+	exportModule.setColumnWidth(7, 150);
+	exportModule.setColumnWidth(8, 150);
+	exportModule.setColumnWidth(9, 150);
+	exportModule.setColumnWidth(10, 75);
+	exportModule.addHeaderRow([
+		'ID', 'User Story', 'Resolution', 'TA Owners of US', 'TA Owners of DE', 'TA Owner Consistency',
+		'Root Cause Version', 'Root Cause Reference', 'Root Cause Iteration&#10;[' + inputIterationName.value + ']', 'Iteration Consistency'
+	]);
+	for (var i = 0; i < output_DEsUnderUSs.length; ++i) {
+		var deClass = output_DEsUnderUSs[i];
+
+		if (deClass.Resolution == 'Not a Defect') {
+			arrNotADefect.push(deClass);
+			continue;
+		}
+
+		exportModule.appendNewRow([
+			deClass.FormattedID,
+			deClass.UserStory,
+			deClass.Resolution,
+			deClass.TAOwners_US,
+			deClass.TAOwners_DE,
+			deClass.TAOwnerConsistency,
+			(deClass.RootCauseVersion == null) ? '' : deClass.RootCauseVersion,
+			(deClass.RootCauseReference == null) ? '' : deClass.RootCauseReference,
+			deClass.RCIteration,
+			deClass.IterationConsistency
+		]);
+	}
+	for (var i = 0; i < arrNotADefect.length; ++i) {
+		var deClass = arrNotADefect[i];
+		exportModule.appendNewRow([
+			deClass.FormattedID,
+			deClass.UserStory,
+			deClass.Resolution,
+			deClass.TAOwners_US,
+			deClass.TAOwners_DE,
+			deClass.TAOwnerConsistency,
+			(deClass.RootCauseVersion == null) ? '' : deClass.RootCauseVersion,
+			(deClass.RootCauseReference == null) ? '' : deClass.RootCauseReference,
+			deClass.RCIteration,
+			deClass.IterationConsistency
+		]);
+	}
+	exportModule.improveReadability();
+
+	if (exportModule.writeToFile(inputOutputFilePath.value) == true) {
+		//console.console.log("ture");
+		lastSuccessfulOutputFilePath = inputOutputFilePath.value;
+
+		btnShowInExplorer.disabled = false;
+	} else {
+		alert("Error(s) occurred. See console for more details.");
+	}
+
+	exportModule.destroy();
+
+	console.log('Done');
+}
+
+function onJobStart() {
+	// Initialize output values
+	output_IndependentDEs = [];
+	output_DEsUnderUSs = [];
+
+	btnDoTheJob.disabled = true;
+	selectProjects.disabled = true;
+	inputIterationName.disabled = true;
+	inputOutputFilePath.disabled = true;
+
+	rallyModule.init();
+}
+
+function onError(error) {
+	console.log(error);
+
+	// TODO: Handle this error
+	onJobFinish();
+	alert("Error(s) occurred. See console for more details.");
+}
+
+function onJobFinish() {
+	rallyModule.destroy();
+
+	output_IndependentDEs = null;
+	output_DEsUnderUSs = null;
+
+	btnDoTheJob.disabled = false;
+	selectProjects.disabled = false;
+	inputIterationName.disabled = false;
+	inputOutputFilePath.disabled = false;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+function GetProjects() {
+	console.log('Loading projects...');
+
+	rallyModule.init();
+
+	rallyModule.queryWorkspaces()
+	.then(function(result) {
+		return rallyModule.queryProjects_fromCollection(
+			result.Results[0].Projects  // TODO: Currently we only care about the first workspace returned
+		);
+	})
+	.then(populateSelectProject)
+	.then(function() {
+		rallyModule.destroy();
+
+		btnDoTheJob.disabled = false;
+		selectProjects.disabled = false;
+	})
+	.fail(onError);
+}
+
+function populateSelectProject(result) {
+	var projectResults = result.Results;
+	// For each project result, get its name and id, and fill a select option
+	for (var i = 0; i < projectResults.length; ++i) {
+		var option = document.createElement('option');
+		option.value = rallyModule.getIdOutOfRef(projectResults[i]._ref);
+		option.text = projectResults[i].Name;
+		selectProjects.add(option);
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
